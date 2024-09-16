@@ -58,6 +58,8 @@ String formatNodeList(String json) {
     // Витягуємо ID ноди
     String nodeId = json.substring(start, end);
     nodeId.trim();
+    nodeId.replace("}", "");
+    nodeId.replace("]", "");
 
     // Додаємо ID ноди у форматований список
     if (!firstNode) {
@@ -67,7 +69,7 @@ String formatNodeList(String json) {
     firstNode = false;
   }
 
-  formattedList += "]"; // Закриваємо форматований список
+//  formattedList += "]"; // Закриваємо форматований список
   return formattedList;
 }
 
@@ -91,6 +93,11 @@ void loop() {
   if (SerialBT.available()) {
     String str = SerialBT.readString();
     str.trim();
+
+    // Ігноруємо порожні повідомлення
+    if (str.length() == 0) {
+      return;
+    }
 
     // Перевірка на команди debug
     if (str.equals("dbg1")) {
