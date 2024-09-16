@@ -39,6 +39,37 @@ void receivedCallback( uint32_t from, String &msg ) {
   SerialBT.print(str1);
 }
 
+String formatNodeList(String json) {
+  String formattedList = "nodes: ";
+  int start = 0;
+  int end = 0;
+  bool firstNode = true; // Прапор для додавання коми між нодами
+
+  // Проходимо по JSON-рядку, щоб витягти ID нод
+  while ((start = json.indexOf("\"nodeId\":", end)) != -1) {
+    start += 9; // Пропускаємо "nodeId":
+    end = json.indexOf(",", start); // Знаходимо кінець ID або кінець об'єкта
+
+    // Якщо не знайшли кому, шукаємо кінець об'єкта
+    if (end == -1) {
+      end = json.indexOf("}", start);
+    }
+
+    // Витягуємо ID ноди
+    String nodeId = json.substring(start, end);
+    nodeId.trim();
+
+    // Додаємо ID ноди у форматований список
+    if (!firstNode) {
+      formattedList += ","; // Додаємо розділювач між елементами
+    }
+    formattedList += nodeId;
+    firstNode = false;
+  }
+
+  formattedList += "]"; // Закриваємо форматований список
+  return formattedList;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -64,6 +95,12 @@ void loop() {
     // Перевірка на команди debug
     if (str.equals("dbg1")) {
       debugi = true;
+      String jsonNodeList = mesh.subConnectionJson();
+      // Форматуємо рядок у бажаний формат
+      String formattedNodeList = formatNodeList(jsonNodeList);
+
+      SerialBT.println(formattedNodeList);
+
     } else if (str.equals("dbg0")) {
       debugi = false;
     } else {
