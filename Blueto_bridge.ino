@@ -110,6 +110,8 @@ void loop() {
 
     } else if (str.equals("dbg0")) {
       debugi = false;
+    } else if (str.equals("kyy")) {
+      SerialBT.print("ky");
     } else {
       // Відправляємо повідомлення в mesh-мережу
       mesh.sendBroadcast(str);
