@@ -132,21 +132,19 @@ void setup(){
   Serial.println("MASTER: BT+SPI готовий.");
 }
 
-void loop(){
-  // одноразове привітання після реального підключення
-  if (SerialBT.hasClient() && bt_connected && !hello_sent){
-    SerialBT.print("hello\n");
-    hello_sent = true;
-  }
-
-  // моргалка ~1 Гц
-  static uint32_t t=0; if (millis()-t>1000){ digitalWrite(LED_PIN, !digitalRead(LED_PIN)); t=millis(); }
+void loop() {
+  // hello одноразово
+  if (SerialBT.hasClient() && bt_connected && !hello_sent) { SerialBT.print("hello\n"); hello_sent = true; }
 
   pullInputFromBTorUSB();
 
-  if (digitalRead(PIN_READY) == HIGH){
-    spiExchange32();
-    handleRx();
-    delay(20);
+  // обмін починаємо, якщо (а) SLAVE має дані АБО (б) у нас є пакет
+  if (have_pending || digitalRead(PIN_READY)==HIGH) {
+    do {
+      spiExchange32();
+      handleRx();
+      // коротка пауза лише щоб SLAVE встиг поставити наступну чергу
+      delayMicroseconds(200);
+    } while (digitalRead(PIN_READY)==HIGH); // зливаємо "хвіст" без лишніх очікувань
   }
 }

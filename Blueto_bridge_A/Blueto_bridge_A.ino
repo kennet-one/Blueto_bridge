@@ -119,8 +119,6 @@ void setup(){
 
 // ======= loop =======
 void loop(){
-  // моргалка 2 Гц
-  static uint32_t t=0; if (millis()-t>500){ digitalWrite(LED_PIN, !digitalRead(LED_PIN)); t=millis(); }
 
   mesh.update();
 
