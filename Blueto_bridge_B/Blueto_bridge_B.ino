@@ -1,19 +1,18 @@
 #include <SPI.h>
 #include <BluetoothSerial.h>
 
-// ======= Піни (VSPI) =======
+// ===== Pins (VSPI) =====
 static const int PIN_SCK   = 18;
 static const int PIN_MISO  = 19;
 static const int PIN_MOSI  = 23;
 static const int PIN_CS    = 5;
-static const int PIN_READY = 13;        // з SLAVE GPIO4
-static const uint32_t SPI_HZ = 2000000; // 2 МГц
+static const int PIN_READY = 13;        // <- SLAVE GPIO4
 
-static const int LED_PIN = 2;           // опц. моргалка
+static const uint32_t SPI_HZ = 4000000; // 4 MHz (можна 8 MHz при коротких дротах)
 
 BluetoothSerial SerialBT;
 
-// ======= 32B протокол =======
+// ===== 32B frame =====
 static const uint8_t FRAME_SIZE = 32;
 static const uint8_t MAGIC      = 0xA5;
 enum : uint8_t { T_NOP=0, T_TEXT=1, T_DOUBLE=2 };
@@ -21,6 +20,10 @@ enum : uint8_t { T_NOP=0, T_TEXT=1, T_DOUBLE=2 };
 uint8_t  tx_frame[FRAME_SIZE];
 uint8_t  rx_frame[FRAME_SIZE];
 uint16_t seq_tx = 0;
+
+// --- BT/USB input (newline-framed, no timeouts) ---
+static char    bt_buf[24];  static uint8_t bt_len  = 0;
+static char    usb_buf[24]; static uint8_t usb_len = 0;
 
 char   pending_text[24] = {0};
 bool   have_pending = false;
@@ -30,8 +33,12 @@ double pending_double = 0.0;
 volatile bool bt_connected = false;
 bool hello_sent = false;
 
-// ======= helpers =======
-static inline uint8_t checksum(const uint8_t* f){ uint8_t c=0; for (int i=0;i<=28;i++) c^=f[i]; return c; }
+// READY interrupt (optional)
+volatile bool readyFlag = false;
+void IRAM_ATTR readyISR() { readyFlag = true; }
+
+// ===== utils =====
+static inline uint8_t checksum(const uint8_t* f){ uint8_t c=0; for(int i=0;i<=28;i++) c^=f[i]; return c; }
 static inline uint8_t safeLen24(const char* s){ uint8_t n=0; while (n<24 && s[n]) n++; return n; }
 
 void buildFrame(uint8_t type, uint16_t seq, const uint8_t* data, uint8_t len){
@@ -61,25 +68,39 @@ void bt_cb(esp_spp_cb_event_t e, esp_spp_cb_param_t*){
   if (e==ESP_SPP_CLOSE_EVT)   { bt_connected = false; hello_sent = false; }
 }
 
-void pullInputFromBTorUSB(){
-  if (SerialBT.available()){
-    String in = SerialBT.readString(); in.trim();
-    if (in.length()){
-      if (in.startsWith("d ")) { pending_double=in.substring(2).toDouble(); doubleMode=true; }
-      else { in.toCharArray(pending_text,sizeof(pending_text)); doubleMode=false; }
-      have_pending=true;
+// --- byte pumps (формує пакет тільки на '\n') ---
+void btPump() {
+  while (SerialBT.available()) {
+    char c = (char)SerialBT.read();
+    if (c=='\r') continue;
+    if (c=='\n') {
+      if (bt_len==0) break;                 // ігноримо порожні
+      bt_buf[bt_len]=0;
+      if (bt_len>=2 && bt_buf[0]=='d' && bt_buf[1]==' ') { pending_double=atof(bt_buf+2); doubleMode=true; }
+      else { memcpy(pending_text, bt_buf, min((int)sizeof(pending_text),(int)bt_len+1)); doubleMode=false; }
+      bt_len=0; have_pending=true; break;
     }
+    if (bt_len < sizeof(bt_buf)-1) bt_buf[bt_len++]=c;
+    else { bt_buf[bt_len]=0; memcpy(pending_text, bt_buf, sizeof(pending_text)); bt_len=0; doubleMode=false; have_pending=true; break; }
   }
-  if (Serial.available()){
-    String in = Serial.readString(); in.trim();
-    if (in.length()){
-      if (in.startsWith("d ")) { pending_double=in.substring(2).toDouble(); doubleMode=true; }
-      else { in.toCharArray(pending_text,sizeof(pending_text)); doubleMode=false; }
-      have_pending=true;
+}
+void usbPump() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c=='\r') continue;
+    if (c=='\n') {
+      if (usb_len==0) break;
+      usb_buf[usb_len]=0;
+      if (usb_len>=2 && usb_buf[0]=='d' && usb_buf[1]==' ') { pending_double=atof(usb_buf+2); doubleMode=true; }
+      else { memcpy(pending_text, usb_buf, min((int)sizeof(pending_text),(int)usb_len+1)); doubleMode=false; }
+      usb_len=0; have_pending=true; break;
     }
+    if (usb_len < sizeof(usb_buf)-1) usb_buf[usb_len++]=c;
+    else { usb_buf[usb_len]=0; memcpy(pending_text, usb_buf, sizeof(pending_text)); usb_len=0; doubleMode=false; have_pending=true; break; }
   }
 }
 
+// --- SPI ---
 void spiExchange32(){
   if (have_pending){
     if (doubleMode) makeDouble(pending_double);
@@ -91,11 +112,11 @@ void spiExchange32(){
 
   SPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
   digitalWrite(PIN_CS, LOW);
-  for (uint8_t i=0;i<FRAME_SIZE;i++) rx_frame[i] = SPI.transfer(tx_frame[i]);
+  for (uint8_t i=0;i<FRAME_SIZE;i++) rx_frame[i]=SPI.transfer(tx_frame[i]);
   digitalWrite(PIN_CS, HIGH);
   SPI.endTransaction();
 
-  memset(tx_frame, 0, FRAME_SIZE);
+  memset(tx_frame,0,FRAME_SIZE);
 }
 
 void handleRx(){
@@ -103,9 +124,16 @@ void handleRx(){
   if (!parseFrame(rx_frame,type,seq,data,len)) return;
 
   if (type==T_TEXT && len){
-    String s; s.reserve(len); for(uint8_t i=0;i<len;i++) s+=(char)data[i];
-    // лише LF, без CR — щоб у Python не з’являлись порожні рядки
-    SerialBT.print(s); SerialBT.print('\n');
+    String s; s.reserve(len);
+    for(uint8_t i=0;i<len;i++) s+=(char)data[i];
+    while (s.length() && (s[s.length()-1]=='\n' || s[s.length()-1]=='\r')) s.remove(s.length()-1);
+    if (!s.length()) return;
+
+    // надсилаємо у BT як байти + '\n' і обов'язково flush
+    SerialBT.write((const uint8_t*)s.c_str(), s.length());
+    SerialBT.write('\n');
+    SerialBT.flush();
+
     Serial.printf("[S->] TEXT(%u): %s\n", seq, s.c_str());
   } else if (type==T_DOUBLE && len==8){
     double dv; memcpy(&dv,data,8);
@@ -113,9 +141,8 @@ void handleRx(){
   }
 }
 
+// ===== SETUP / LOOP =====
 void setup(){
-  pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
-
   Serial.begin(115200);
   Serial.printf("ROLE: MASTER, MAC:%llX\n", ESP.getEfuseMac());
 
@@ -123,28 +150,30 @@ void setup(){
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
 
   pinMode(PIN_READY, INPUT_PULLDOWN);
+  attachInterrupt(digitalPinToInterrupt(PIN_READY), readyISR, RISING);
 
-  SerialBT.setTimeout(20);
-  Serial.setTimeout(20);
   SerialBT.begin("Kennet'MASH'");
   SerialBT.register_callback(bt_cb);
 
   Serial.println("MASTER: BT+SPI готовий.");
 }
 
-void loop() {
-  // hello одноразово
-  if (SerialBT.hasClient() && bt_connected && !hello_sent) { SerialBT.print("hello\n"); hello_sent = true; }
+void loop(){
+  if (SerialBT.hasClient() && bt_connected && !hello_sent){
+    SerialBT.print("hello\n");
+    hello_sent = true;
+  }
 
-  pullInputFromBTorUSB();
+  btPump();
+  usbPump();
 
-  // обмін починаємо, якщо (а) SLAVE має дані АБО (б) у нас є пакет
-  if (have_pending || digitalRead(PIN_READY)==HIGH) {
+  // Стартуємо SPI, якщо: (а) є наш пакет, або (б) SLAVE підняв READY
+  if (have_pending || readyFlag || digitalRead(PIN_READY)==HIGH) {
     do {
+      readyFlag=false;
       spiExchange32();
       handleRx();
-      // коротка пауза лише щоб SLAVE встиг поставити наступну чергу
-      delayMicroseconds(200);
-    } while (digitalRead(PIN_READY)==HIGH); // зливаємо "хвіст" без лишніх очікувань
+      delayMicroseconds(200);  // дати SLAVE поставити наступну чергу
+    } while (digitalRead(PIN_READY)==HIGH);
   }
 }
