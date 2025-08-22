@@ -31,7 +31,6 @@ portMUX_TYPE qMux = portMUX_INITIALIZER_UNLOCKED;
 
 inline uint8_t qInc(uint8_t i){ i++; if(i>=QSIZE) i=0; return i; }
 inline bool qEmpty(){ return qHead==qTail; }
-
 void qPushFrame(const uint8_t* f){
   portENTER_CRITICAL(&qMux);
   uint8_t next = qInc(qHead);
@@ -49,13 +48,21 @@ bool qPopFrame(uint8_t* out){
   return true;
 }
 
-uint16_t seq_tx = 0;
-bool     queued = false;
+// ===== ACK/SEQ state (stop-and-wait) =====
+uint16_t tx_seq = 0;                 // наш лічильник відправок (SLAVE->MASTER)
+uint16_t inflight_seq = 0;
+bool     awaiting_ack = false;
+uint8_t  inflight_frame[FRAME_SIZE];
 
+uint16_t rx_last_ok = 0;             // останній коректно прийнятий SEQ від MASTER (ACK)
+uint16_t rx_last_delivered = 0;      // антидубль: останній доставлений у mesh/локально
+
+bool     queued = false;
 inline void setReady(bool r){ digitalWrite(PIN_READY, r?HIGH:LOW); }
 
+// ===== протокол helpers =====
 static inline uint8_t checksum(const uint8_t* f){ uint8_t c=0; for(int i=0;i<=28;i++) c^=f[i]; return c; }
-static inline void buildFrameTo(uint8_t* buf, uint8_t type, uint16_t seq, const uint8_t* data, uint8_t len){
+static inline void buildFrameTo(uint8_t* buf, uint8_t type, uint16_t seq, const uint8_t* data, uint8_t len, uint16_t ackseq){
   if (len>24) len=24;
   memset(buf,0,FRAME_SIZE);
   buf[0]=MAGIC; buf[1]=type;
@@ -63,14 +70,18 @@ static inline void buildFrameTo(uint8_t* buf, uint8_t type, uint16_t seq, const 
   buf[3]=(uint8_t)(seq >> 8);
   buf[4]=len;
   if (len) memcpy(&buf[5], data, len);
-  buf[29]=checksum(buf);
+  buf[29]=checksum(buf);          // XOR 0..28
+  buf[30]=(uint8_t)(ackseq & 0xFF);
+  buf[31]=(uint8_t)(ackseq >> 8);
 }
-bool parseFrame(const uint8_t* f, uint8_t& type, uint16_t& seq, uint8_t* data, uint8_t& len){
+bool parseFrame(const uint8_t* f, uint8_t& type, uint16_t& seq, uint8_t* data, uint8_t& len, uint16_t& ackseq){
   if (f[0]!=MAGIC) return false;
   if (checksum(f)!=f[29]) return false;
-  type=f[1]; seq=(uint16_t)f[2] | ((uint16_t)f[3]<<8);
-  len=f[4]; if (len>24) len=24;
+  type=f[1];
+  seq  = (uint16_t)f[2] | ((uint16_t)f[3]<<8);
+  len  = f[4]; if (len>24) len=24;
   if (data && len) memcpy(data,&f[5],len);
+  ackseq = (uint16_t)f[30] | ((uint16_t)f[31]<<8);
   return true;
 }
 
@@ -81,14 +92,17 @@ void enqueueText(const String& sIn){
   if (!s.length()) return;
   uint8_t b[24]; uint8_t n=(uint8_t)min(24,(int)s.length());
   memcpy(b, s.c_str(), n);
-  uint8_t fr[FRAME_SIZE]; buildFrameTo(fr, T_TEXT, ++seq_tx, b, n); qPushFrame(fr);
+  uint8_t fr[FRAME_SIZE]; buildFrameTo(fr, T_TEXT, ++tx_seq, b, n, rx_last_ok);
+  qPushFrame(fr);
 }
 void enqueueDouble(double v){
   uint8_t b[8]; memcpy(b,&v,8);
-  uint8_t fr[FRAME_SIZE]; buildFrameTo(fr, T_DOUBLE, ++seq_tx, b, 8); qPushFrame(fr);
+  uint8_t fr[FRAME_SIZE]; buildFrameTo(fr, T_DOUBLE, ++tx_seq, b, 8, rx_last_ok);
+  qPushFrame(fr);
 }
 void enqueueNOP(){
-  uint8_t fr[FRAME_SIZE]; buildFrameTo(fr, T_NOP, ++seq_tx, nullptr, 0); qPushFrame(fr);
+  uint8_t fr[FRAME_SIZE]; buildFrameTo(fr, T_NOP, ++tx_seq, nullptr, 0, rx_last_ok);
+  qPushFrame(fr);
 }
 
 // ---- SPI queue/trigger ----
@@ -96,7 +110,7 @@ void queueOnce(){
   if (!queued){
     slave.queue(tx_frame, rx_frame, FRAME_SIZE);
     slave.trigger();
-    setReady(true);       // READY=HIGH поки стоїть черга (узгоджено з MASTER)
+    setReady(true);       // рівневий READY
     queued = true;
   }
 }
@@ -107,6 +121,45 @@ void receivedCallback(uint32_t from, String &msg){
   enqueueText(msg);            // у чергу — без торкання DMA
 }
 void newConnectionCallback(uint32_t){}
+
+// ---- Локальна обробка службових команд моста ----
+bool selfHandle(String cmd){
+  cmd.trim();
+  if (!cmd.length()) return true; // порожні не пускаємо в mesh
+  if (cmd == "ky") { enqueueText("kyy"); return true; }
+  return false;                   // не обробили тут — підемо в mesh
+}
+
+// --- ACK-aware підготовка TX кадра ---
+void prepareTxFrameWithAck(){
+  const uint16_t ack_to_send = rx_last_ok;
+
+  if (awaiting_ack){
+    // повтор: inflight + оновити поля ACK
+    memcpy(tx_frame, inflight_frame, FRAME_SIZE);
+    tx_frame[30]=(uint8_t)(ack_to_send & 0xFF);
+    tx_frame[31]=(uint8_t)(ack_to_send >> 8);
+  } else {
+    // новий кадр з черги або NOP
+    if (!qPopFrame(tx_frame)) {
+      // якщо черга порожня — згенеруємо NOP з поточним ACK
+      buildFrameTo(tx_frame, T_NOP, ++tx_seq, nullptr, 0, ack_to_send);
+    } else {
+      // вийняли кадр, але підставимо актуальний ACK
+      tx_frame[30]=(uint8_t)(ack_to_send & 0xFF);
+      tx_frame[31]=(uint8_t)(ack_to_send >> 8);
+    }
+    // зафіксувати "в польоті" якщо не NOP
+    bool nonEmpty = (tx_frame[1]!=T_NOP || tx_frame[4]!=0);
+    if (nonEmpty){
+      memcpy(inflight_frame, tx_frame, FRAME_SIZE);
+      inflight_seq = (uint16_t)tx_frame[2] | ((uint16_t)tx_frame[3]<<8);
+      awaiting_ack = true;
+    } else {
+      awaiting_ack = false;
+    }
+  }
+}
 
 // ===== setup =====
 void setup(){
@@ -121,17 +174,18 @@ void setup(){
   mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
   mesh.onReceive(&receivedCallback);
   mesh.onNewConnection(&newConnectionCallback);
-  // опц.: mesh.setRoot(true); mesh.setContainsRoot(true);
 
   slave.setQueueSize(1);
   slave.setDataMode(SPI_MODE0);
   slave.begin(VSPI, PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
 
+  // перший кадр (привіт)
   enqueueText("Hello from SLAVE!");
-  if (!qPopFrame(tx_frame)) { enqueueNOP(); qPopFrame(tx_frame); }
+  // підготуємо перший TX кадр (із ACK=0) і поставимо чергу
+  prepareTxFrameWithAck();
   queueOnce();
 
-  Serial.println("SLAVE: mesh+SPI готовий.");
+  Serial.println("SLAVE: mesh+SPI (ACK) готовий.");
 }
 
 // ===== loop =====
@@ -141,7 +195,7 @@ void loop(){
   mesh.update();
 
   if (!queued){
-    if (!qPopFrame(tx_frame)) { enqueueNOP(); qPopFrame(tx_frame); }
+    prepareTxFrameWithAck();
     queueOnce();
   }
 
@@ -150,20 +204,38 @@ void loop(){
     queued = false;
 
     // прийняте від MASTER
-    uint8_t type,len,data[24]; uint16_t seq;
-    if (parseFrame(rx_frame,type,seq,data,len)){
-      if (type==T_TEXT && len){
-        String cmd; cmd.reserve(len); for(uint8_t i=0;i<len;i++) cmd+=(char)data[i];
-        Serial.printf("[M->] %s\n", cmd.c_str());
-        mesh.sendBroadcast(cmd);   // міст не генерує echo/ACK
-      } else if (type==T_DOUBLE && len==8){
-        double dv; memcpy(&dv,data,8);
-        // при потребі: mesh.sendBroadcast(String("double:")+String(dv,6));
+    uint8_t type,len,data[24]; uint16_t rseq, rack;
+    if (parseFrame(rx_frame,type,rseq,data,len,rack)){
+      // підтвердження нашого кадра?
+      if (awaiting_ack && rack == inflight_seq){
+        awaiting_ack = false;
+      }
+
+      // антидубль
+      bool is_dup = (rseq == rx_last_delivered);
+      if (!is_dup){
+        rx_last_delivered = rseq;
+        rx_last_ok        = rseq;   // піднімемо ACK у наших наступних кадрах
+
+        if (type==T_TEXT && len){
+          String cmd; cmd.reserve(len); for(uint8_t i=0;i<len;i++) cmd+=(char)data[i];
+          Serial.printf("[M->] %s\n", cmd.c_str());
+
+          // 1) спочатку пробуємо локально (ky -> kyy)
+          if (!selfHandle(cmd)) {
+            // 2) якщо не обробили локально — широкомовно у mesh
+            mesh.sendBroadcast(cmd);
+          }
+
+        } else if (type==T_DOUBLE && len==8){
+          double dv; memcpy(&dv,data,8);
+          // за потреби: mesh.sendBroadcast(String("double:")+String(dv,6));
+        }
       }
     }
 
-    // наступний кадр: або з черги, або NOP
-    if (!qPopFrame(tx_frame)) { enqueueNOP(); qPopFrame(tx_frame); }
+    // підготуємо наступний TX кадр (з урахуванням ACK/ретрансу) і знову ставимо чергу
+    prepareTxFrameWithAck();
     queueOnce();
   }
 }
