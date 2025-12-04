@@ -10,6 +10,11 @@ static const int PIN_READY = 13;   // <- SLAVE GPIO4
 
 static const uint32_t SPI_HZ = 4000000; // 4 MHz (можна 8+ при коротких дротах)
 
+// -------- UART до root-ноди --------
+static const int UART_ROOT_RX = 16;   // MASTER RX  <- TX root
+static const int UART_ROOT_TX = 17;   // MASTER TX  -> RX root
+HardwareSerial RootSerial(2);         // Serial2
+
 BluetoothSerial SerialBT;
 
 // ===== 40B frame =====
@@ -24,6 +29,8 @@ uint8_t  rx_frame[FRAME_SIZE];
 // ---- Ввід із BT/USB по рядках ----
 static char    bt_buf[32];  static uint8_t bt_len  = 0;
 static char    usb_buf[32]; static uint8_t usb_len = 0;
+static char    root_buf[32];
+static uint8_t root_len = 0;
 
 char   pending_text[33] = {0};  // 32 + '\0'
 bool   have_pending = false;
@@ -49,6 +56,47 @@ uint16_t rx_last_delivered = 0;      // антидубль SLAVE->MASTER
 // ===== utils =====
 static inline uint8_t checksum37(const uint8_t* f){ uint8_t c=0; for(int i=0;i<=36;i++) c^=f[i]; return c; }
 static inline uint8_t safeLen32(const char* s){ uint8_t n=0; while (n<32 && s[n]) n++; return n; }
+
+void rootPump() {
+  while (RootSerial.available()) {
+    char c = (char)RootSerial.read();
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      if (root_len == 0) break;
+      root_buf[root_len] = 0;
+
+      // Від root -> в BT і в USB-лог
+      if (bt_connected) {
+        SerialBT.write((const uint8_t*)root_buf, root_len);
+        SerialBT.write('\n');
+        SerialBT.flush();
+      }
+      Serial.print("[ROOT->PC] ");
+      Serial.println(root_buf);
+
+      root_len = 0;
+      break;
+    }
+
+    if (root_len < sizeof(root_buf) - 1) {
+      root_buf[root_len++] = c;
+    } else {
+      // overflow: просто відправляємо те, що є
+      root_buf[root_len] = 0;
+      if (bt_connected) {
+        SerialBT.write((const uint8_t*)root_buf, root_len);
+        SerialBT.write('\n');
+        SerialBT.flush();
+      }
+      Serial.print("[ROOT->PC OVF] ");
+      Serial.println(root_buf);
+      root_len = 0;
+      break;
+    }
+  }
+}
+
 
 void buildFrame(uint8_t type, uint16_t seq, const uint8_t* data, uint8_t len, uint16_t ackseq){
   if (len>32) len=32;
@@ -95,7 +143,18 @@ void btPump() {
       bt_len=0; have_pending=true; break;
     }
     if (bt_len < sizeof(bt_buf)-1) bt_buf[bt_len++]=c;
-    else { bt_buf[bt_len]=0; memcpy(pending_text, bt_buf, sizeof(pending_text)); bt_len=0; doubleMode=false; have_pending=true; break; }
+    else { 
+      bt_buf[bt_len]=0;
+      memcpy(pending_text, bt_buf, sizeof(pending_text));
+              // Додатково відправити рядок в root по UART
+      RootSerial.write((const uint8_t*)bt_buf, bt_len);
+      RootSerial.write('\n');
+      RootSerial.flush();
+
+      bt_len=0; 
+      doubleMode=false;
+      have_pending=true;
+      break; }
   }
 }
 void usbPump() {
@@ -110,7 +169,18 @@ void usbPump() {
       usb_len=0; have_pending=true; break;
     }
     if (usb_len < sizeof(usb_buf)-1) usb_len++;
-    else { usb_buf[usb_len]=0; memcpy(pending_text, usb_buf, sizeof(pending_text)); usb_len=0; doubleMode=false; have_pending=true; break; }
+    else { 
+      usb_buf[usb_len]=0; 
+      memcpy(pending_text, usb_buf, sizeof(pending_text)); 
+
+      RootSerial.write((const uint8_t*)usb_buf, usb_len);
+      RootSerial.write('\n');
+      RootSerial.flush();
+
+      usb_len=0; 
+      doubleMode=false; 
+      have_pending=true; 
+      break; }
   }
 }
 
@@ -167,11 +237,22 @@ void handleRx(){
     // обрізати краєві пробіли/CR/LF — на всяк випадок
     while (s.length() && (s[s.length()-1]=='\n'||s[s.length()-1]=='\r'||s[s.length()-1]==' ')) s.remove(s.length()-1);
     if (s.length()){
-      SerialBT.write((const uint8_t*)s.c_str(), s.length());
-      SerialBT.write('\n');
-      SerialBT.flush();
-      // Serial.printf("[S->] %s\n", s.c_str());
+    // в BT
+      if (bt_connected) {
+        SerialBT.write((const uint8_t*)s.c_str(), s.length());
+        SerialBT.write('\n');
+        SerialBT.flush();
+      }
+      // в root по UART
+      RootSerial.write((const uint8_t*)s.c_str(), s.length());
+      RootSerial.write('\n');
+      RootSerial.flush();
+
+      // дебаг в USB
+      Serial.print("[SPI->] ");
+      Serial.println(s);
     }
+
   } else if (type==T_DOUBLE && len==8){
     double dv; memcpy(&dv,data,8);
     // при потребі: SerialBT.printf("d %.10f\n", dv);
@@ -188,6 +269,9 @@ void setup(){
   pinMode(PIN_READY, INPUT_PULLDOWN);
   attachInterrupt(digitalPinToInterrupt(PIN_READY), readyISR, RISING);
 
+  RootSerial.begin(115200, SERIAL_8N1, UART_ROOT_RX, UART_ROOT_TX);
+  Serial.println("Root UART started 115200 on RX=16, TX=17");
+
   SerialBT.begin("Kennet'MASH'");
   SerialBT.register_callback(bt_cb);
 
@@ -202,6 +286,7 @@ void loop(){
 
   btPump();
   usbPump();
+  rootPump();     
 
   // Працюємо, коли є дані до відправки або SLAVE підняв READY
   if (have_pending || readyFlag || digitalRead(PIN_READY)==HIGH) {
